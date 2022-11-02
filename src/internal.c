@@ -199,6 +199,18 @@ ldd_parse_line(struct elf_shared_object_iterator *iter)
  */
 #define ELF_RELOC_JUMP_SLOT 7
 
+/*
+ * For ARM, i.e. R_AARCH64_JUMP_SLOT 1026
+ */
+#define ELF_AARCH64_JUMP_SLOT 1026
+#define ELF_ARM_JUMP_SLOT 22
+
+/*
+ * On aarch64 the PLT-0 entry is 32 bytes.
+ * And it is NOT plt.entsize
+ */
+#define ELF_AARCH64_PLT0_ENTSIZE 32
+
 bool
 build_plt_data(struct elfobj *obj)
 {
@@ -210,7 +222,23 @@ build_plt_data(struct elfobj *obj)
 	uint64_t plt_addr;
 	elf_iterator_res_t res;
 	bool secure_plt = false;
+	size_t plt0_entsize;
+	int jmpslot_reloc;
 
+	switch(elf_arch(obj)) {
+	case x64:
+	case i386:
+		jmpslot_reloc = ELF_RELOC_JUMP_SLOT;
+		break;
+	case aarch64:
+		jmpslot_reloc = ELF_AARCH64_JUMP_SLOT;
+		break;
+	case arm:
+		jmpslot_reloc = ELF_ARM_JUMP_SLOT;
+		break;
+	default:
+		return false;
+	}
 	/*
 	 * Must check for .plt.sec first to handle -fcf-protection
 	 */
@@ -219,6 +247,7 @@ build_plt_data(struct elfobj *obj)
 			return false;
 		}
 	} else {
+		obj->flags |= ELF_SECURE_PLT_F;
 		secure_plt = true;
 	}
 	/*
@@ -252,14 +281,16 @@ build_plt_data(struct elfobj *obj)
 		e.data = (void *)plt_node;
 		hsearch_r(e, ENTER, &ep, &obj->cache.plt);
 	}
-	plt_addr = (secure_plt == true) ? plt.address : plt.address + plt.entsize;
+	plt0_entsize = elf_arch(obj) == aarch64 ? ELF_AARCH64_PLT0_ENTSIZE : plt.entsize;
+	plt_addr = (secure_plt == true) ? plt.address : plt.address + plt0_entsize;
+
 	for (;;) {
 		res = elf_relocation_iterator_next(&r_iter, &r_entry);
 		if (res == ELF_ITER_ERROR)
 			return false;
 		if (res == ELF_ITER_DONE)
 			break;
-		if (r_entry.type != ELF_RELOC_JUMP_SLOT)
+		if (r_entry.type != jmpslot_reloc)
 			continue;
 		plt_node = malloc(sizeof(*plt_node));
 		if (plt_node == NULL)
@@ -509,6 +540,17 @@ ldso_cache_check_flags(struct elf_shared_object_iterator *iter,
 	} else if (iter->obj->arch == x64) {
 		if (flags == 0x303)
 			return true;
+	} else if (iter->obj->arch == aarch64) {
+		if (flags == (FLAG_AARCH64_LIB64 | FLAG_ELF_LIBC6))
+			return true;
+	} else if (iter->obj->arch == arm) {
+		if ((flags == (FLAG_ARM_LIBHF | FLAG_ELF_LIBC6)) ||
+		    flags == (FLAG_ELF_LIBC6)) {
+			return true;
+		} else if ((flags == (FLAG_ARM_LIBSF | FLAG_ELF_LIBC6)) ||
+		    flags == (FLAG_ELF_LIBC6)) {
+			return true;
+		}
 	}
 	return false;
 }
@@ -1384,9 +1426,10 @@ i386:
  * the smallest entry address would be 0x41, assuming the program header
  * table was shifted forward, such as in a reverse text infection.
  */
-#define GLIBC_START_CODE_64	"\x55\x48\x89\xe5\x48" /* enough to identify _start */
-#define GLIBC_START_CODE_64_v2	"\x31\xed\x49\x89\xd1" /* enough to identify _start */
-#define GLIBC_START_CODE_32	"\x31\xed\x5e\x89\xe1" /* enough to identify _start */
+#define GLIBC_START_CODE_x86_64	"\x55\x48\x89\xe5\x48" /* enough to identify _start */
+#define GLIBC_START_CODE_x86_64_v2	"\x31\xed\x49\x89\xd1" /* enough to identify _start */
+#define GLIBC_START_CODE_x86_32	"\x31\xed\x5e\x89\xe1" /* enough to identify _start */
+#define GLIBC_START_CODE_aarch64 "\x1f\x20\x03\xd5\x1d\x00\x80\xd2" /* enough to identify _start */
 
 static uint64_t
 original_ep(elfobj_t *obj)
@@ -1399,16 +1442,24 @@ original_ep(elfobj_t *obj)
 		if (i >= (elf_text_offset(obj) + elf_text_filesz(obj) - 6))
 			return 0;
 		if (obj->arch == x64) {
-			if (memcmp(&inst[i], GLIBC_START_CODE_64,
-			    sizeof(GLIBC_START_CODE_64) - 1) == 0)
+			if (memcmp(&inst[i], GLIBC_START_CODE_x86_64,
+			    sizeof(GLIBC_START_CODE_x86_64) - 1) == 0)
 				return elf_text_base(obj) + inst - marker;
-			else if (memcmp(&inst[i], GLIBC_START_CODE_64_v2,
-				    sizeof(GLIBC_START_CODE_64_v2) - 1) == 0)
+			else if (memcmp(&inst[i], GLIBC_START_CODE_x86_64_v2,
+				    sizeof(GLIBC_START_CODE_x86_64_v2) - 1) == 0)
 					return elf_text_base(obj) + inst - marker;
 		} else if (obj->arch == i386) {
-			if (memcmp(&inst[i], GLIBC_START_CODE_32,
-			    sizeof(GLIBC_START_CODE_32) - 1) == 0)
+			if (memcmp(&inst[i], GLIBC_START_CODE_x86_32,
+			    sizeof(GLIBC_START_CODE_x86_32) - 1) == 0)
 				return elf_text_base(obj) + inst - marker;
+		} else if (obj->arch == aarch64) {
+			if (memcmp(&inst[i], GLIBC_START_CODE_aarch64,
+			    sizeof(GLIBC_START_CODE_aarch64) - 1) == 0)
+				return elf_text_base(obj) + inst - marker;
+		} else if (obj->arch == arm) {
+			/*
+			 * TODO
+			 */
 		}
 	}
 	return 0;
